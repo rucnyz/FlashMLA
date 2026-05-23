@@ -107,17 +107,32 @@ get_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params)
 }
 
 void run_get_decoding_sched_meta_kernel(GetDecodeSchedMetaParams &params) {
-    // aginfer patch: cudaFuncSetAttribute rejects very-small or non-positive
-    // smem sizes on B300/sm_100, which the caller can hit when the decode
-    // batch transiently shrinks to 0 (e.g. heavy radix eviction with a tight
-    // KV pool and no HiCache spill). Skip the kernel entirely in that case --
-    // there's nothing to schedule, and the caller already handles an absent
-    // metadata buffer further down the decode path.
+    // aginfer patch: cudaFuncSetAttribute is a host API that mutates kernel
+    // attributes -- it cannot be called inside a captured CUDA graph or while
+    // a graph is active on the stream, and the error surface ("invalid
+    // argument") is the same one we saw on sglang's dsv4 decode path
+    // (cuda_graph: True). Instead, set the attribute ONCE at module init to
+    // the largest size the kernel will ever need (capacity bound: a 8K-batch
+    // would need 4 * (8192 * 5 + 1) = 163844 bytes; we round up to 192 KB
+    // which is still well under sm_100's 228 KB per-block cap), then per-call
+    // only launches the kernel.
+    static const int kMaxSmemBytes = 192 * 1024;
+    static bool attr_set = []() {
+        cudaError_t err = cudaFuncSetAttribute(
+            get_mla_metadata_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            kMaxSmemBytes);
+        if (err != cudaSuccess) {
+            // Fall back to silently leaving it at the default opt-in shared
+            // memory size; tiny decode batches don't need the high-shmem path.
+        }
+        return err == cudaSuccess;
+    }();
+    (void)attr_set;
     if (params.b <= 0) {
         return;
     }
-    int smem_size = sizeof(int) * (params.b*5+1);
-    CHECK_CUDA(cudaFuncSetAttribute(get_mla_metadata_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    int smem_size = sizeof(int) * (params.b * 5 + 1);
     get_mla_metadata_kernel<<<1, 32, smem_size, params.stream>>>(params);
     CHECK_CUDA_KERNEL_LAUNCH();
 }
