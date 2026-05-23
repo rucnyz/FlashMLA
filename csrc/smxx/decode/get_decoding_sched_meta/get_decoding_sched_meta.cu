@@ -107,32 +107,50 @@ get_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params)
 }
 
 void run_get_decoding_sched_meta_kernel(GetDecodeSchedMetaParams &params) {
-    // aginfer patch: cudaFuncSetAttribute is a host API that mutates kernel
-    // attributes -- it cannot be called inside a captured CUDA graph or while
-    // a graph is active on the stream, and the error surface ("invalid
-    // argument") is the same one we saw on sglang's dsv4 decode path
-    // (cuda_graph: True). Instead, set the attribute ONCE at module init to
-    // the largest size the kernel will ever need (capacity bound: a 8K-batch
-    // would need 4 * (8192 * 5 + 1) = 163844 bytes; we round up to 192 KB
-    // which is still well under sm_100's 228 KB per-block cap), then per-call
-    // only launches the kernel.
-    static const int kMaxSmemBytes = 192 * 1024;
-    static bool attr_set = []() {
-        cudaError_t err = cudaFuncSetAttribute(
-            get_mla_metadata_kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            kMaxSmemBytes);
-        if (err != cudaSuccess) {
-            // Fall back to silently leaving it at the default opt-in shared
-            // memory size; tiny decode batches don't need the high-shmem path.
-        }
-        return err == cudaSuccess;
-    }();
-    (void)attr_set;
+    // aginfer patch: bound-check on the per-block dynamic-shared-memory request.
+    //
+    // The metadata kernel allocates `sizeof(int) * (b * 5 + 1)` bytes of
+    // dynamic smem. sm_100 (B300) caps a single block's dynamic smem at
+    // 228 KB, so any b > ~11673 makes the launch fail with "invalid
+    // argument" -- and the original upstream code called the kernel
+    // unconditionally and surfaced the failure at CHECK_CUDA_KERNEL_LAUNCH.
+    //
+    // We observed this on sglang's dsv4 NSA decode path under tight KV
+    // pressure (e.g. max_total_tokens=262144, HiCache OFF, harbor
+    // swebenchpro -n 32). In that regime sglang occasionally passes
+    // b in the 13K range -- presumably from a mixed-batch / pre-aggregated
+    // query layout -- which exceeds the smem limit.
+    //
+    // Surfacing the constraint here turns a generic CUDA error into a
+    // diagnostic that points at the right place; the real fix has to live
+    // in the caller (avoid passing oversized b, or chunk the metadata
+    // computation), not in this kernel which is by design single-block.
     if (params.b <= 0) {
         return;
     }
     int smem_size = sizeof(int) * (params.b * 5 + 1);
+    constexpr int kSmemHardCap = 228 * 1024;   // sm_100 per-block dynamic-smem cap
+    constexpr int kSmemOptInThreshold = 48 * 1024;
+    if (smem_size > kSmemHardCap) {
+        fprintf(stderr,
+            "[FlashMLA aginfer] get_decoding_sched_meta: requested smem %d B "
+            "exceeds per-block cap %d B (b=%d). The caller is passing a batch "
+            "larger than this single-block metadata kernel can handle on sm_100.\n",
+            smem_size, kSmemHardCap, params.b);
+        fflush(stderr);
+        cudaError_t e = cudaErrorInvalidValue;
+        CHECK_CUDA(e);
+    }
+    if (smem_size > kSmemOptInThreshold) {
+        // Opt-in for >48 KB smem. Swallow the error: if the host API rejects
+        // it (e.g. we are on a stream with an active capture), the kernel
+        // launch below will surface the real problem.
+        cudaFuncSetAttribute(
+            get_mla_metadata_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_size);
+        (void)cudaGetLastError();
+    }
     get_mla_metadata_kernel<<<1, 32, smem_size, params.stream>>>(params);
     CHECK_CUDA_KERNEL_LAUNCH();
 }
